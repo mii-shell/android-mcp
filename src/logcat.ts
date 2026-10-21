@@ -12,7 +12,7 @@ export type Level = (typeof LEVELS)[number];
 const cursors = new Map<string, string>();
 
 export interface LogcatOptions {
-  pkg?: string;
+  pkg: string;
   level?: Level;
   grep?: string;
   sinceLast: boolean;
@@ -21,12 +21,10 @@ export interface LogcatOptions {
 
 export async function logcat(serial: string, opts: LogcatOptions): Promise<string> {
   const args = ["logcat", "-d", "-v", "threadtime", "-t", String(BACKLOG_LINES)];
-  if (opts.pkg) {
-    // Filtering by uid keeps the lines of earlier processes of the app too, e.g. the one that crashed.
-    const uid = await packageUid(serial, opts.pkg);
-    if (!uid) throw new ToolError(`Package ${opts.pkg} is not installed.`);
-    args.push(`--uid=${uid}`);
-  }
+  // Filtering by uid keeps the lines of earlier processes of the app too, e.g. the one that crashed.
+  const uid = await packageUid(serial, opts.pkg);
+  if (!uid) throw new ToolError(`Package ${opts.pkg} is not installed.`);
+  args.push(`--uid=${uid}`);
   args.push(`*:${opts.level ?? "V"}`);
 
   let lines = (await adbText(serial, args, { timeoutMs: 30_000 }))
@@ -34,7 +32,7 @@ export async function logcat(serial: string, opts: LogcatOptions): Promise<strin
     .map((l) => l.trimEnd())
     .filter((l) => l && !l.startsWith("--------- beginning of"));
 
-  const key = `${serial}|${opts.pkg ?? ""}|${opts.level ?? ""}|${opts.grep ?? ""}`;
+  const key = `${serial}|${opts.pkg}|${opts.level ?? ""}|${opts.grep ?? ""}`;
   const cursor = cursors.get(key);
   if (opts.sinceLast && cursor) {
     const at = lines.lastIndexOf(cursor);

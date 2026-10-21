@@ -1,8 +1,28 @@
 # android-mcp
 
-MCP server that lets an agent use any Android app on a local emulator or a real device the way a person does:
-look at the screen, tap, swipe, type, press keys, wait for things to appear and read logcat. It drives the
-devices through `adb`, so every device Android Studio sees works here too.
+MCP server that lets an agent use the Android app you are developing, on a local emulator or a real device, the way
+a person does: look at the screen, tap, swipe, type, press keys, wait for things to appear and read logcat. It drives
+the devices through `adb`, so every device Android Studio sees works here too.
+
+## Only Android Studio dev builds
+
+The server only works with apps installed by **Run in Android Studio**. A package qualifies when all of these hold
+(read from `dumpsys package`):
+
+- `DEBUGGABLE`: a debug build.
+- `TEST_ONLY`: Android Studio injects `android:testOnly="true"` into builds started from the IDE, and such APKs can
+  only be installed with `adb install -t`, never through the Play Store or the package installer. A
+  `./gradlew installDebug` from the command line doesn't set it, so those installs are refused as well.
+- `initiatingPackageName=com.android.shell` (Android 11+): installed over adb.
+
+Enforcement:
+
+- `launch_app`, `stop_app`, `clear_app_data`, `open_url` and `logcat` only accept such a package.
+- Screen tools (`get_ui`, `screenshot`, `wait_for`, `tap`, `long_press`, `swipe`, `scroll`, `type_text`,
+  `press_key`) check the foreground activity first and refuse while any other app is in front. The exception is the
+  system permission dialog, so runtime permission prompts of the dev app can be answered.
+- When an action leaves the app (e.g. `press_key home`), the response says so instead of showing the screen.
+- There is no install tool: install via Android Studio.
 
 ## Setup
 
@@ -31,7 +51,7 @@ When several devices are connected, every tool needs `serial` (from `list_device
 | Area | Tools |
 |---|---|
 | Devices | `list_devices`, `start_emulator`, `get_screen_info`, `set_orientation` |
-| Apps | `install_apk`, `list_packages`, `current_app`, `launch_app`, `stop_app`, `clear_app_data`, `open_url` |
+| Apps | `list_dev_apps`, `current_app`, `launch_app`, `stop_app`, `clear_app_data`, `open_url` |
 | Observe | `get_ui`, `screenshot`, `wait_for`, `logcat` |
 | Act | `tap`, `long_press`, `swipe`, `scroll`, `type_text`, `press_key` |
 
@@ -46,14 +66,14 @@ When several devices are connected, every tool needs `serial` (from `list_device
   folded into it. `all: true` shows every node.
 - **No tree?** `uiautomator dump` needs the screen to go idle. If it never does (video, endless animation), the
   tools say so and `get_ui` returns a screenshot instead: continue with x/y taps.
-- **`logcat`** with `package` filters by the app's uid, so lines of a crashed earlier process are still included.
+- **`logcat`** filters by the app's uid, so lines of a crashed earlier process are still included.
   By default each call only returns lines that are new since the previous call with the same filters.
 - **`start_emulator`** waits up to ~40 s per call (below the MCP request timeout); call it again to keep waiting.
   Emulator output goes to `$TMPDIR/android-mcp-emulator-<avd>.log`.
 
 ## Typical loop
 
-1. Build the app with its own build (`./gradlew :app:assembleDebug`), then `install_apk`.
+1. Install the app with Run in Android Studio, then `list_dev_apps`.
 2. `launch_app` → read the returned UI tree.
 3. `tap` / `type_text` / `scroll` and read the new state from each response; `wait_for` text after navigation
    or loading instead of sleeping.

@@ -1,30 +1,10 @@
-import { existsSync } from "node:fs";
-import { resolve } from "node:path";
-import { ToolError, adbText, shQuote, shell } from "./adb.js";
+import { ToolError, shQuote, shell } from "./adb.js";
 
 const PACKAGE_RE = /^[A-Za-z0-9_.]+$/;
 
 export function checkPackage(pkg: string): string {
   if (!PACKAGE_RE.test(pkg)) throw new ToolError(`Invalid package name "${pkg}".`);
   return pkg;
-}
-
-export async function installApk(serial: string, path: string, grantPermissions: boolean): Promise<string> {
-  const apk = resolve(path);
-  if (!existsSync(apk)) throw new ToolError(`APK not found: ${apk}`);
-  const args = ["install", "-r", "-t", ...(grantPermissions ? ["-g"] : []), apk];
-  const out = await adbText(serial, args, { timeoutMs: 300_000 });
-  if (!/Success/.test(out)) throw new ToolError(`Install failed: ${out.trim()}`);
-  return `Installed ${apk}.`;
-}
-
-export async function listPackages(serial: string, filter: string | undefined, includeSystem: boolean): Promise<string[]> {
-  const out = await shell(serial, `pm list packages${includeSystem ? "" : " -3"}`);
-  return out
-    .split("\n")
-    .map((l) => l.trim().replace(/^package:/, ""))
-    .filter((p) => p && (!filter || p.toLowerCase().includes(filter.toLowerCase())))
-    .sort();
 }
 
 export async function currentApp(serial: string): Promise<{ pkg: string; activity: string } | undefined> {

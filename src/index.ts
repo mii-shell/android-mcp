@@ -8,6 +8,7 @@ import * as apps from "./apps.js";
 import * as device from "./device.js";
 import * as input from "./input.js";
 import { LOG_LEVELS, logcat } from "./logcat.js";
+import { POLICY_DESCRIPTION, assertDevApp, assertForegroundAllowed, devAppVerdict, foregroundProblem, listDevApps } from "./policy.js";
 import { withDevice } from "./queue.js";
 import { describeDisplay, display, screenshot, toDevice } from "./screen.js";
 import { type Element, TREE_UNAVAILABLE, dumpTree, findElements, formatTree, lastTree } from "./uitree.js";
@@ -26,7 +27,9 @@ const server = new McpServer(
       "or screenshot, act with tap/swipe/type_text/press_key, wait with wait_for, check logcat for crashes. " +
       "All x/y coordinates are screen coordinates as shown in screenshots and get_ui (not raw device pixels). " +
       "Action tools return the new UI state (observe=ui by default). Prefer tap by text/id/index; use x/y from " +
-      "a screenshot for things missing from the tree (maps, canvases, games, video).",
+      "a screenshot for things missing from the tree (maps, canvases, games, video). " +
+      `${POLICY_DESCRIPTION} Screen tools refuse to work while any other app is in the foreground; ` +
+      "start with list_dev_apps and launch_app.",
   },
 );
 
@@ -88,10 +91,20 @@ function onDevice<A extends { serial?: string }>(fn: (serial: string, args: A) =
   };
 }
 
+/** Like onDevice, but refuses to run unless an allowed dev app is in the foreground. */
+function inDevApp<A extends { serial?: string }>(fn: (serial: string, args: A) => Promise<Content>) {
+  return onDevice<A>(async (serial, args) => {
+    await assertForegroundAllowed(serial);
+    return fn(serial, args);
+  });
+}
+
 async function observe(serial: string, mode: "none" | "ui" | "screenshot" | "both", settleMs: number): Promise<Content> {
   // Settle even without observing, so the next action doesn't hit a UI that is still transitioning.
   await sleep(settleMs);
   if (mode === "none") return [];
+  const problem = await foregroundProblem(serial);
+  if (problem) return text(`Not showing the screen: ${problem}`);
   const out: Content = [];
   if (mode === "ui" || mode === "both") {
     try {
@@ -236,23 +249,12 @@ tool(
 // ---- Apps --------------------------------------------------------------------------------------
 
 tool(
-  "install_apk",
-  "Install (or update) an APK file from the local machine. Build it first with the project's own build (e.g. ./gradlew :app:assembleDebug).",
-  {
-    ...SERIAL,
-    path: z.string().describe("Path to the .apk on this machine"),
-    grant_permissions: z.boolean().default(false).describe("Grant all runtime permissions (-g)"),
-  },
-  onDevice(async (serial, a) => text(await apps.installApk(serial, a.path, a.grant_permissions))),
-);
-
-tool(
-  "list_packages",
-  "List installed packages (third-party only unless include_system).",
-  { ...SERIAL, filter: z.string().optional(), include_system: z.boolean().default(false) },
-  onDevice(async (serial, a) => {
-    const pkgs = await apps.listPackages(serial, a.filter, a.include_system);
-    return text(pkgs.length ? pkgs.join("\n") : "No matching packages.");
+  "list_dev_apps",
+  `List the apps this server may use. ${POLICY_DESCRIPTION}`,
+  { ...SERIAL },
+  onDevice(async (serial) => {
+    const pkgs = await listDevApps(serial);
+    return text(pkgs.length ? pkgs.join("\n") : "No Android Studio dev builds installed. Install one with Run in Android Studio.");
   }),
 );
 
@@ -262,47 +264,64 @@ tool(
   { ...SERIAL },
   onDevice(async (serial) => {
     const app = await apps.currentApp(serial);
-    return text(app ? `${app.pkg}/${app.activity}` : "Could not determine the foreground activity.");
+    if (!app) return text("Could not determine the foreground activity.");
+    const verdict = await devAppVerdict(serial, app.pkg);
+    return text(`${app.pkg}/${app.activity} (${verdict.allowed ? "allowed" : `not allowed: ${verdict.reason}`})`);
   }),
 );
 
 tool(
   "launch_app",
-  "Launch an app by package (its launcher activity), or a specific activity.",
+  "Launch an allowed dev app by package (its launcher activity), or a specific activity of it.",
   {
     ...SERIAL,
     package: z.string(),
     activity: z.string().optional().describe("e.g. .MainActivity or com.foo/.MainActivity"),
     ...OBSERVE,
   },
-  onDevice(async (serial, a) => [
-    ...text(await apps.launchApp(serial, a.package, a.activity)),
-    ...(await observe(serial, a.observe, Math.max(a.settle_ms, 1500))),
-  ]),
+  onDevice(async (serial, a) => {
+    await assertDevApp(serial, a.package);
+    if (a.activity?.includes("/") && !a.activity.startsWith(`${a.package}/`)) {
+      throw new ToolError(`Activity ${a.activity} does not belong to ${a.package}.`);
+    }
+    return [
+      ...text(await apps.launchApp(serial, a.package, a.activity)),
+      ...(await observe(serial, a.observe, Math.max(a.settle_ms, 1500))),
+    ];
+  }),
 );
 
 tool(
   "stop_app",
   "Force-stop an app.",
   { ...SERIAL, package: z.string() },
-  onDevice(async (serial, a) => text(await apps.stopApp(serial, a.package))),
+  onDevice(async (serial, a) => {
+    await assertDevApp(serial, a.package);
+    return text(await apps.stopApp(serial, a.package));
+  }),
 );
 
 tool(
   "clear_app_data",
   "Delete all data of an app (like a fresh install). Also stops it.",
   { ...SERIAL, package: z.string() },
-  onDevice(async (serial, a) => text(await apps.clearAppData(serial, a.package))),
+  onDevice(async (serial, a) => {
+    await assertDevApp(serial, a.package);
+    return text(await apps.clearAppData(serial, a.package));
+  }),
 );
 
 tool(
   "open_url",
-  "Open a URL / deep link with an ACTION_VIEW intent.",
-  { ...SERIAL, url: z.string(), package: z.string().optional().describe("Restrict to this app"), ...OBSERVE },
-  onDevice(async (serial, a) => [
-    ...text(await apps.openUrl(serial, a.url, a.package)),
-    ...(await observe(serial, a.observe, Math.max(a.settle_ms, 1000))),
-  ]),
+  "Open a URL / deep link in an allowed dev app with an ACTION_VIEW intent.",
+  { ...SERIAL, url: z.string(), package: z.string().describe("The dev app that should handle the link"), ...OBSERVE },
+  onDevice(async (serial, a) => {
+    await assertDevApp(serial, a.package);
+    return [
+      ...text(await apps.openUrl(serial, a.url, a.package)),
+      ...(await observe(serial, a.observe, Math.max(a.settle_ms, 1000))),
+    ];
+  }),
 );
 
 // ---- Observe -----------------------------------------------------------------------------------
@@ -311,7 +330,7 @@ tool(
   "screenshot",
   "Take a screenshot. Its pixel coordinates are the screen coordinates every other tool uses.",
   { ...SERIAL },
-  onDevice(async (serial) => {
+  inDevApp(async (serial) => {
     const shot = await screenshot(serial);
     return [
       { type: "image", data: shot.png.toString("base64"), mimeType: "image/png" },
@@ -325,7 +344,7 @@ tool(
   "Dump the visible UI as a numbered element list (class, text, desc, id, centre, size, flags). " +
     "Elements can then be targeted by index. Falls back to a screenshot when no tree is available.",
   { ...SERIAL, all: z.boolean().default(false).describe("Include layout-only nodes") },
-  onDevice(async (serial, a) => {
+  inDevApp(async (serial, a) => {
     try {
       return text(formatTree(await dumpTree(serial), a.all));
     } catch (e) {
@@ -351,12 +370,13 @@ tool(
     timeout_ms: z.number().int().min(0).max(120_000).default(10_000),
     observe: z.enum(["none", "ui", "screenshot", "both"]).default("ui"),
   },
-  onDevice(async (serial, a) => {
+  inDevApp(async (serial, a) => {
     if ((a.text === undefined) === (a.id === undefined)) throw new ToolError("Give exactly one of text or id.");
     const what = a.text !== undefined ? `text "${a.text}"` : `id "${a.id}"`;
     const deadline = Date.now() + a.timeout_ms;
     let lastError = "";
     do {
+      await assertForegroundAllowed(serial);
       try {
         const found = findElements(await dumpTree(serial), { text: a.text, id: a.id, exact: a.exact }).length > 0;
         if (found !== a.gone) {
@@ -378,18 +398,19 @@ tool(
 
 tool(
   "logcat",
-  "Read the device log. With a package, only that app's lines (including crashed earlier processes). " +
+  "Read the log of an allowed dev app (including lines of crashed earlier processes). " +
     "By default returns only lines that are new since the previous call with the same filters.",
   {
     ...SERIAL,
-    package: z.string().optional(),
+    package: z.string(),
     level: z.enum(LOG_LEVELS).optional().describe("Minimum priority: V D I W E F"),
     grep: z.string().optional().describe("Case-insensitive regex applied to each line"),
     since_last: z.boolean().default(true),
     max_lines: z.number().int().min(1).max(2_000).default(200),
   },
-  onDevice(async (serial, a) =>
-    text(
+  onDevice(async (serial, a) => {
+    await assertDevApp(serial, a.package);
+    return text(
       await logcat(serial, {
         pkg: a.package,
         level: a.level,
@@ -397,8 +418,8 @@ tool(
         sinceLast: a.since_last,
         maxLines: a.max_lines,
       }),
-    ),
-  ),
+    );
+  }),
 );
 
 // ---- Act ---------------------------------------------------------------------------------------
@@ -407,7 +428,7 @@ tool(
   "tap",
   "Tap an element (by index, text or id) or a screen point (x, y).",
   { ...SERIAL, ...TARGET, ...OBSERVE },
-  onDevice(async (serial, a) => {
+  inDevApp(async (serial, a) => {
     const target = await resolveTarget(serial, a);
     await input.tap(serial, target.x, target.y);
     return [...text(`Tapped ${target.label}.`), ...(await observe(serial, a.observe, a.settle_ms))];
@@ -418,7 +439,7 @@ tool(
   "long_press",
   "Long-press an element (by index, text or id) or a screen point (x, y).",
   { ...SERIAL, ...TARGET, duration_ms: z.number().int().min(100).max(10_000).default(1000), ...OBSERVE },
-  onDevice(async (serial, a) => {
+  inDevApp(async (serial, a) => {
     const target = await resolveTarget(serial, a);
     await input.swipe(serial, target.x, target.y, target.x, target.y, a.duration_ms);
     return [...text(`Long-pressed ${target.label}.`), ...(await observe(serial, a.observe, a.settle_ms))];
@@ -437,7 +458,7 @@ tool(
     duration_ms: z.number().int().min(10).max(10_000).default(300),
     ...OBSERVE,
   },
-  onDevice(async (serial, a) => {
+  inDevApp(async (serial, a) => {
     const d = await display(serial);
     const [x1, y1] = toDevice(d, a.from_x, a.from_y);
     const [x2, y2] = toDevice(d, a.to_x, a.to_y);
@@ -460,7 +481,7 @@ tool(
     amount: z.number().min(0.1).max(1).default(0.6).describe("Fraction of the area to scroll"),
     ...OBSERVE,
   },
-  onDevice(async (serial, a) => {
+  inDevApp(async (serial, a) => {
     let area: { x1: number; y1: number; x2: number; y2: number };
     if (a.index !== undefined) {
       const element = lastTree(serial)?.elements[a.index];
@@ -505,7 +526,7 @@ tool(
     submit: z.boolean().default(false).describe("Press enter afterwards"),
     ...OBSERVE,
   },
-  onDevice(async (serial, a) => {
+  inDevApp(async (serial, a) => {
     const steps: string[] = [];
     const hasTarget = a.index !== undefined || a.text !== undefined || a.id !== undefined || a.x !== undefined;
     let field: Element | undefined;
@@ -535,7 +556,7 @@ tool(
   "press_key",
   `Press a key: ${input.KEY_NAMES.join(", ")}, any KEYCODE_* name, or a key code number.`,
   { ...SERIAL, key: z.string(), ...OBSERVE },
-  onDevice(async (serial, a) => {
+  inDevApp(async (serial, a) => {
     const code = await input.pressKey(serial, a.key);
     return [...text(`Pressed ${code}.`), ...(await observe(serial, a.observe, a.settle_ms))];
   }),
