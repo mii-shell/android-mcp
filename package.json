@@ -1,0 +1,28 @@
+{
+  "name": "android-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for driving Android apps on local emulators and devices via adb",
+  "type": "module",
+  "bin": {
+    "android-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "fast-xml-parser": "^5.11.2",
+    "sharp": "^0.35.5",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}

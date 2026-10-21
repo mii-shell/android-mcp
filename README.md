@@ -1,0 +1,68 @@
+# android-mcp
+
+MCP server that lets an agent use any Android app on a local emulator or a real device the way a person does:
+look at the screen, tap, swipe, type, press keys, wait for things to appear and read logcat. It drives the
+devices through `adb`, so every device Android Studio sees works here too.
+
+## Setup
+
+Requirements: Node 20+, the Android SDK platform-tools (`adb`) and, for AVDs, the emulator. The SDK is found
+via `$ANDROID_HOME`, `$ANDROID_SDK_ROOT`, `~/Android/Sdk`, `~/Library/Android/sdk` or `PATH`.
+
+```bash
+npm install
+npm run build
+claude mcp add --scope user android -- node "$PWD/dist/index.js"
+```
+
+During development `npm run dev` (tsx) runs the sources directly; rebuild and run `/mcp` → reconnect in Claude Code
+after changes.
+
+### Real devices
+
+- USB: enable *Developer options → USB debugging*, plug in, accept the RSA prompt.
+- Wi-Fi (Android 11+): *Developer options → Wireless debugging → Pair device with pairing code*, then
+  `adb pair <ip>:<pair-port>` and `adb connect <ip>:<port>`.
+
+When several devices are connected, every tool needs `serial` (from `list_devices`).
+
+## Tools
+
+| Area | Tools |
+|---|---|
+| Devices | `list_devices`, `start_emulator`, `get_screen_info`, `set_orientation` |
+| Apps | `install_apk`, `list_packages`, `current_app`, `launch_app`, `stop_app`, `clear_app_data`, `open_url` |
+| Observe | `get_ui`, `screenshot`, `wait_for`, `logcat` |
+| Act | `tap`, `long_press`, `swipe`, `scroll`, `type_text`, `press_key` |
+
+- **One coordinate space.** Screenshots are downscaled so the long edge is at most 1280 px. `get_ui` reports
+  element centres in the same space, and every x/y input uses it, so a point read off a screenshot can be tapped as is.
+- **Act + observe in one call.** Action tools wait `settle_ms` (500 ms default) and return the new UI tree
+  (`observe: "ui"`), a screenshot, both, or nothing.
+- **Targets.** `tap`/`long_press`/`type_text` take `index` (from the last `get_ui`), `text` (text or content
+  description, substring unless `exact`), `id` (resource id / Compose test tag), or `x`+`y`.
+- **`get_ui` output** lists only visible elements that carry text, a description, a leaf id or an interaction
+  flag. A clickable container without its own text shows its children's text as `~"…"`, and those children are
+  folded into it. `all: true` shows every node.
+- **No tree?** `uiautomator dump` needs the screen to go idle. If it never does (video, endless animation), the
+  tools say so and `get_ui` returns a screenshot instead: continue with x/y taps.
+- **`logcat`** with `package` filters by the app's uid, so lines of a crashed earlier process are still included.
+  By default each call only returns lines that are new since the previous call with the same filters.
+- **`start_emulator`** waits up to ~40 s per call (below the MCP request timeout); call it again to keep waiting.
+  Emulator output goes to `$TMPDIR/android-mcp-emulator-<avd>.log`.
+
+## Typical loop
+
+1. Build the app with its own build (`./gradlew :app:assembleDebug`), then `install_apk`.
+2. `launch_app` → read the returned UI tree.
+3. `tap` / `type_text` / `scroll` and read the new state from each response; `wait_for` text after navigation
+   or loading instead of sleeping.
+4. `logcat` with `package` and `level: "E"` to catch crashes and errors.
+
+## Limitations
+
+- `type_text` supports printable ASCII only (`adb shell input text`). Use `press_key enter` for new lines.
+- No multi-touch gestures (pinch). Zoom maps with double-tap or their zoom controls.
+- Compose test tags appear as `id=` only if the app sets `Modifier.semantics { testTagsAsResourceId = true }` at its
+  root (worth enabling in debug builds); otherwise target Compose elements by text or content description.
+- Each UI dump takes about 1 to 3 s depending on the device. Use `observe: "none"` for steps you don't need to see.
