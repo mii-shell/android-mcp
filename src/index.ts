@@ -7,6 +7,7 @@ import { ToolError, sleep } from "./adb.js";
 import * as apps from "./apps.js";
 import * as device from "./device.js";
 import * as input from "./input.js";
+import { CRASH_TYPES, deviceTimeMinutesAgo, findCrash, formatCrash, formatCrashList, readCrashes } from "./crashes.js";
 import { LOG_LEVELS, logcat } from "./logcat.js";
 import { POLICY_DESCRIPTION, assertDevApp, assertForegroundAllowed, devAppVerdict, foregroundProblem, listDevApps } from "./policy.js";
 import { withDevice } from "./queue.js";
@@ -419,6 +420,46 @@ tool(
         maxLines: a.max_lines,
       }),
     );
+  }),
+);
+
+tool(
+  "list_crashes",
+  "List recorded crashes, ANRs and native crashes of a dev app, newest first, with exception and top frame. " +
+    "Reports survive the process and logcat rotation.",
+  {
+    ...SERIAL,
+    package: z.string(),
+    types: z.array(z.enum(CRASH_TYPES)).default(["crash", "anr", "native"]),
+    since_minutes: z.number().int().min(1).optional().describe("Only crashes from the last N minutes"),
+    limit: z.number().int().min(1).max(100).default(10),
+  },
+  onDevice(async (serial, a) => {
+    await assertDevApp(serial, a.package);
+    let crashes = await readCrashes(serial, a.package, a.types);
+    if (a.since_minutes !== undefined) {
+      const since = await deviceTimeMinutesAgo(serial, a.since_minutes);
+      crashes = crashes.filter((c) => c.time >= since);
+    }
+    return text(formatCrashList(crashes.slice(0, a.limit), crashes.length));
+  }),
+);
+
+tool(
+  "get_crash",
+  "Full report of one crash from list_crashes: header (process, version, time) and the complete stack trace.",
+  {
+    ...SERIAL,
+    package: z.string(),
+    id: z.string().describe("Id from list_crashes, e.g. crash@2026-10-22 13:57:56"),
+    max_lines: z.number().int().min(10).max(2_000).default(200),
+  },
+  onDevice(async (serial, a) => {
+    await assertDevApp(serial, a.package);
+    const type = a.id.split("@")[0];
+    if (!CRASH_TYPES.includes(type as never)) throw new ToolError(`Invalid crash id ${a.id}.`);
+    const crashes = await readCrashes(serial, a.package, [type as (typeof CRASH_TYPES)[number]]);
+    return text(formatCrash(findCrash(crashes, a.id), a.max_lines));
   }),
 );
 

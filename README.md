@@ -70,7 +70,8 @@ When several devices are connected, every tool needs `serial` (from `list_device
 |---|---|
 | Devices | `list_devices`, `start_emulator`, `get_screen_info`, `set_orientation` |
 | Apps | `list_dev_apps`, `current_app`, `launch_app`, `stop_app`, `clear_app_data`, `open_url` |
-| Observe | `get_ui`, `screenshot`, `wait_for`, `logcat` |
+| Observe | `get_ui`, `screenshot`, `wait_for` |
+| Diagnose | `logcat`, `list_crashes`, `get_crash` |
 | Act | `tap`, `long_press`, `swipe`, `scroll`, `type_text`, `press_key` |
 
 - **One coordinate space.** Screenshots are downscaled so the long edge is at most 1280 px. `get_ui` reports
@@ -86,6 +87,10 @@ When several devices are connected, every tool needs `serial` (from `list_device
   screenshot instead: continue with x/y taps.
 - **`logcat`** filters by the app's uid, so lines of a crashed earlier process are still included.
   By default each call only returns lines that are new since the previous call with the same filters.
+- **`list_crashes` / `get_crash`** read the system DropBox (`dumpsys dropbox`): Java crashes, ANRs and native
+  crashes of the app, newest first, each with exception and top frame; `get_crash` returns the full report with the
+  complete stack trace. Unlike logcat, these reports survive the process and log rotation. `since_minutes` limits the
+  list to recent crashes.
 - **`start_emulator`** waits up to ~40 s per call (below the MCP request timeout); call it again to keep waiting.
   Emulator output goes to `$TMPDIR/android-mcp-emulator-<avd>.log`.
 
@@ -95,7 +100,8 @@ When several devices are connected, every tool needs `serial` (from `list_device
 2. `launch_app` → read the returned UI tree.
 3. `tap` / `type_text` / `scroll` and read the new state from each response; `wait_for` text after navigation
    or loading instead of sleeping.
-4. `logcat` with `package` and `level: "E"` to catch crashes and errors.
+4. `list_crashes` to see whether the app crashed, `get_crash` for the stack trace, and `logcat` with `level: "E"` for
+   errors that didn't crash it.
 
 ## Limitations
 
