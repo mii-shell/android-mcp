@@ -11,8 +11,16 @@ import { CRASH_TYPES, deviceTimeMinutesAgo, findCrash, formatCrash, formatCrashL
 import { LOG_LEVELS, logcat } from "./logcat.js";
 import { POLICY_DESCRIPTION, assertDevApp, assertForegroundAllowed, devAppVerdict, foregroundProblem, listDevApps } from "./policy.js";
 import { withDevice } from "./queue.js";
-import { describeDisplay, display, screenshot, toDevice } from "./screen.js";
-import { type Element, TREE_UNAVAILABLE, dumpTree, findElements, formatTree, lastTree } from "./uitree.js";
+import { describeDisplay, display, screenshot, toDevice, zoomShot } from "./screen.js";
+import {
+  type Element,
+  contentLabels,
+  dumpTree,
+  findByRef,
+  findElements,
+  formatChanges,
+  formatTree,
+} from "./uitree.js";
 
 const DEFAULT_SETTLE_MS = 300;
 const WAIT_POLL_MS = 400;
@@ -27,8 +35,10 @@ const server = new McpServer(
       "Drive Android apps on local emulators/devices like a human: observe with get_ui (accessibility tree) " +
       "or screenshot, act with tap/swipe/type_text/press_key, wait with wait_for, check logcat for crashes. " +
       "All x/y coordinates are screen coordinates as shown in screenshots and get_ui (not raw device pixels). " +
-      "Action tools return the new UI state (observe=ui by default). Prefer tap by text/id/index; use x/y from " +
-      "a screenshot for things missing from the tree (maps, canvases, games, video). " +
+      "Action tools report what changed on screen (observe=changes by default); element [ref] numbers stay valid " +
+      "across calls. Prefer tap by text/id/index; use x/y from a screenshot only for things missing from the tree " +
+      "(maps, canvases, games, video). Screenshots cost far more tokens than the tree: request them only when the " +
+      "tree is not enough. To read a long list or form, use read_all instead of scrolling step by step. " +
       `${POLICY_DESCRIPTION} Screen tools refuse to work while any other app is in the foreground; ` +
       "start with list_dev_apps and launch_app.",
   },
@@ -38,16 +48,22 @@ const SERIAL = {
   serial: z.string().optional().describe("adb serial; optional when exactly one device is connected"),
 };
 
+const OBSERVE_MODES = ["none", "changes", "ui", "screenshot", "both"] as const;
+type ObserveMode = (typeof OBSERVE_MODES)[number];
+
 const OBSERVE = {
   observe: z
-    .enum(["none", "ui", "screenshot", "both"])
-    .default("ui")
-    .describe("What to return after the action (default ui)"),
+    .enum(OBSERVE_MODES)
+    .default("changes")
+    .describe(
+      "What to return after the action: changes (default: only what changed since you last saw the screen, " +
+        "full tree on a new screen), ui (full tree), screenshot, both (tree + screenshot), none",
+    ),
   settle_ms: z.number().int().min(0).max(10_000).default(DEFAULT_SETTLE_MS).describe("Wait before observing"),
 };
 
 const TARGET = {
-  index: z.number().int().optional().describe("Element index from the last get_ui"),
+  index: z.number().int().optional().describe("Element [ref] from get_ui or a change report"),
   text: z.string().optional().describe("Match element text or content description (case-insensitive)"),
   id: z.string().optional().describe("Match resource id / Compose testTag"),
   exact: z.boolean().default(false).describe("Require the whole text/id to match instead of a substring"),
@@ -100,20 +116,21 @@ function inDevApp<A extends { serial?: string }>(fn: (serial: string, args: A) =
   });
 }
 
-async function observe(serial: string, mode: "none" | "ui" | "screenshot" | "both", settleMs: number): Promise<Content> {
+async function observe(serial: string, mode: ObserveMode, settleMs: number): Promise<Content> {
   // Settle even without observing, so the next action doesn't hit a UI that is still transitioning.
   await sleep(settleMs);
   if (mode === "none") return [];
   const problem = await foregroundProblem(serial);
   if (problem) return text(`Not showing the screen: ${problem}`);
   const out: Content = [];
-  if (mode === "ui" || mode === "both") {
+  if (mode !== "screenshot") {
     try {
-      out.push({ type: "text", text: formatTree(await dumpTree(serial), false) });
+      const tree = await dumpTree(serial);
+      out.push({ type: "text", text: mode === "changes" ? formatChanges(tree) : formatTree(tree, false) });
     } catch (e) {
       out.push({ type: "text", text: e instanceof ToolError ? e.message : String(e) });
       // Without a tree the agent needs pixels to continue.
-      if (mode === "ui") mode = "screenshot";
+      if (mode !== "both") mode = "screenshot";
     }
   }
   if (mode === "screenshot" || mode === "both") {
@@ -125,7 +142,7 @@ async function observe(serial: string, mode: "none" | "ui" | "screenshot" | "bot
 
 function describeElement(e: Element): string {
   const label = e.text || e.desc || e.childText || e.id;
-  return `[${e.index}] ${e.cls}${label ? ` "${label}"` : ""}`;
+  return `[${e.ref}] ${e.cls}${label ? ` "${label}"` : ""}`;
 }
 
 /** Returns the device-pixel point for a target plus a short description of it. */
@@ -142,10 +159,8 @@ async function resolveTarget(serial: string, t: TargetArgs): Promise<{ x: number
 
   let element: Element | undefined;
   if (t.index !== undefined) {
-    const tree = lastTree(serial);
-    if (!tree) throw new ToolError("No UI tree yet; call get_ui first.");
-    element = tree.elements[t.index];
-    if (!element) throw new ToolError(`No element [${t.index}] in the last get_ui (${tree.elements.length} elements).`);
+    element = findByRef(await dumpTree(serial), t.index);
+    if (!element) throw new ToolError(`Element [${t.index}] is no longer on screen; call get_ui.`);
   } else {
     const tree = await dumpTree(serial);
     const found = findElements(tree, { text: t.text, id: t.id, exact: t.exact });
@@ -329,9 +344,24 @@ tool(
 
 tool(
   "screenshot",
-  "Take a screenshot. Its pixel coordinates are the screen coordinates every other tool uses.",
-  { ...SERIAL },
-  inDevApp(async (serial) => {
+  "Take a screenshot (costs far more tokens than get_ui; use it for visuals the tree lacks). Its pixel " +
+    "coordinates are the screen coordinates every other tool uses. With region, returns a sharper crop for " +
+    "reading small text; a crop's pixels are NOT screen coordinates.",
+  {
+    ...SERIAL,
+    region: z
+      .object({ x: z.number(), y: z.number(), w: z.number().positive(), h: z.number().positive() })
+      .optional()
+      .describe("Screen-coordinate rectangle to zoom into"),
+  },
+  inDevApp(async (serial, a) => {
+    if (a.region) {
+      const crop = await zoomShot(serial, a.region);
+      return [
+        { type: "image", data: crop.png.toString("base64"), mimeType: "image/png" },
+        ...text(`Zoomed crop of (${a.region.x},${a.region.y}) ${a.region.w}x${a.region.h}; use screen coordinates to tap.`),
+      ];
+    }
     const shot = await screenshot(serial);
     return [
       { type: "image", data: shot.png.toString("base64"), mimeType: "image/png" },
@@ -342,8 +372,8 @@ tool(
 
 tool(
   "get_ui",
-  "Dump the visible UI as a numbered element list (class, text, desc, id, centre, size, flags). " +
-    "Elements can then be targeted by index. Falls back to a screenshot when no tree is available.",
+  "The visible UI as a list of elements: [ref] (stable across calls), text, desc, id, centre, size, flags. " +
+    "Target elements by ref (index), text or id. Falls back to a screenshot when no tree is available.",
   { ...SERIAL, all: z.boolean().default(false).describe("Include layout-only nodes") },
   inDevApp(async (serial, a) => {
     try {
@@ -369,7 +399,7 @@ tool(
     exact: z.boolean().default(false),
     gone: z.boolean().default(false),
     timeout_ms: z.number().int().min(0).max(120_000).default(10_000),
-    observe: z.enum(["none", "ui", "screenshot", "both"]).default("ui"),
+    observe: z.enum(OBSERVE_MODES).default("changes"),
   },
   inDevApp(async (serial, a) => {
     if ((a.text === undefined) === (a.id === undefined)) throw new ToolError("Give exactly one of text or id.");
@@ -512,21 +542,85 @@ tool(
 );
 
 tool(
+  "read_all",
+  "Read a whole scrollable list or form in one call: scrolls it to the end and returns every entry it " +
+    "contains, in order. Much cheaper than scrolling step by step. Afterwards the list stays at the end.",
+  {
+    ...SERIAL,
+    index: z.number().int().optional().describe("[ref] of the scrollable; default: the largest one on screen"),
+    direction: z.enum(["down", "right"]).default("down"),
+    max_scrolls: z.number().int().min(1).max(50).default(20),
+  },
+  inDevApp(async (serial, a) => {
+    let tree = await dumpTree(serial);
+    const start = a.index !== undefined ? findByRef(tree, a.index) : largestScrollable(tree.elements);
+    if (!start) {
+      throw new ToolError(a.index !== undefined ? `Element [${a.index}] is not on screen.` : "Nothing scrollable on screen.");
+    }
+    const entries: string[] = [];
+    const known = new Set<string>();
+    const collect = (container: Element) => {
+      let added = 0;
+      for (const label of contentLabels(tree, container)) {
+        if (!known.has(label)) {
+          known.add(label);
+          entries.push(label);
+          added++;
+        }
+      }
+      return added;
+    };
+    let container: Element = start;
+    collect(container);
+    let scrolls = 0;
+    let reachedEnd = false;
+    while (scrolls < a.max_scrolls) {
+      const { x1, y1, x2, y2 } = container.bounds;
+      const cx = (x1 + x2) / 2;
+      const cy = (y1 + y2) / 2;
+      const [fx, fy, tx, ty] = (
+        a.direction === "down"
+          ? [cx, cy + (y2 - y1) * 0.35, cx, cy - (y2 - y1) * 0.35]
+          : [cx + (x2 - x1) * 0.35, cy, cx - (x2 - x1) * 0.35, cy]
+      ).map(Math.round);
+      await input.swipe(serial, fx, fy, tx, ty, 400);
+      scrolls++;
+      await sleep(250);
+      tree = await dumpTree(serial);
+      const next = findByRef(tree, start.ref) ?? largestScrollable(tree.elements);
+      if (!next) break;
+      container = next;
+      if (collect(container) === 0) {
+        reachedEnd = true;
+        break;
+      }
+    }
+    const status = reachedEnd
+      ? `reached the end after ${scrolls} scroll(s)`
+      : `stopped after ${scrolls} scroll(s) (raise max_scrolls to read further)`;
+    return text(
+      `${entries.length} entries, ${status}. The list is now scrolled to the end; use get_ui before acting on it.\n` +
+        entries.join("\n"),
+    );
+  }),
+);
+
+tool(
   "scroll",
   "Scroll the content in a direction (down = reveal content below). Scrolls the given element (index), " +
     "otherwise the largest scrollable element on screen (the screen centre only when no UI tree is available).",
   {
     ...SERIAL,
     direction: z.enum(["up", "down", "left", "right"]),
-    index: z.number().int().optional().describe("Scrollable element from the last get_ui"),
+    index: z.number().int().optional().describe("[ref] of the scrollable element"),
     amount: z.number().min(0.1).max(1).default(0.6).describe("Fraction of the area to scroll"),
     ...OBSERVE,
   },
   inDevApp(async (serial, a) => {
     let area: { x1: number; y1: number; x2: number; y2: number };
     if (a.index !== undefined) {
-      const element = lastTree(serial)?.elements[a.index];
-      if (!element) throw new ToolError(`No element [${a.index}] in the last get_ui.`);
+      const element = findByRef(await dumpTree(serial), a.index);
+      if (!element) throw new ToolError(`Element [${a.index}] is no longer on screen; call get_ui.`);
       area = element.bounds;
     } else {
       const tree = await dumpTree(serial).catch(() => undefined);

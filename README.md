@@ -70,16 +70,26 @@ When several devices are connected, every tool needs `serial` (from `list_device
 |---|---|
 | Devices | `list_devices`, `start_emulator`, `get_screen_info`, `set_orientation` |
 | Apps | `list_dev_apps`, `current_app`, `launch_app`, `stop_app`, `clear_app_data`, `open_url` |
-| Observe | `get_ui`, `screenshot`, `wait_for` |
+| Observe | `get_ui`, `read_all`, `screenshot`, `wait_for` |
 | Diagnose | `logcat`, `list_crashes`, `get_crash` |
 | Act | `tap`, `long_press`, `swipe`, `scroll`, `type_text`, `press_key` |
 
-- **One coordinate space.** Screenshots are downscaled so the long edge is at most 1280 px. `get_ui` reports
-  element centres in the same space, and every x/y input uses it, so a point read off a screenshot can be tapped as is.
-- **Act + observe in one call.** Action tools wait `settle_ms` (300 ms default) and return the new UI tree
-  (`observe: "ui"`), a screenshot, both, or nothing.
-- **Targets.** `tap`/`long_press`/`type_text` take `index` (from the last `get_ui`), `text` (text or content
-  description, substring unless `exact`), `id` (resource id / Compose test tag), or `x`+`y`.
+- **One coordinate space.** Screenshots are downscaled so the long edge is at most 768 px (image tokens grow with the
+  pixel count). `get_ui` reports element centres in the same space, and every x/y input uses it, so a point read off a
+  screenshot can be tapped as is. `screenshot` with `region` returns a sharper crop for reading small text; a crop's
+  pixels are not screen coordinates.
+- **Stable refs.** Every element has a `[ref]` that stays the same across calls as long as the element keeps its
+  identity (class, id, label). Refs start at a random base per server process, so refs from before a restart fail
+  instead of hitting another element.
+- **Act + observe in one call.** Action tools wait `settle_ms` (300 ms default) and then report, by default
+  (`observe: "changes"`), only what changed since the agent last saw the screen: added (`+`), changed (`~`) and gone
+  (`-`) elements, or "No visible change". A new screen comes back in full. `ui`, `screenshot`, `both` and `none` are
+  available too.
+- **`read_all`** scrolls a list or form to its end and returns all entries in one call, instead of one call (and one
+  model turn) per scroll.
+- **Targets.** `tap`/`long_press`/`type_text` take `index` (a `[ref]`), `text` (text or content description,
+  substring unless `exact`), `id` (resource id / Compose test tag), or `x`+`y`. Refs are looked up in a fresh read,
+  so they always tap the element's current position.
 - **`get_ui` output** lists only visible elements that carry text, a description, a leaf id or an interaction
   flag. A clickable container without its own text shows its children's text as `~"…"`, and those children are
   folded into it. `all: true` shows every node.
@@ -93,6 +103,13 @@ When several devices are connected, every tool needs `serial` (from `list_device
   list to recent crashes.
 - **`start_emulator`** waits up to ~40 s per call (below the MCP request timeout); call it again to keep waiting.
   Emulator output goes to `$TMPDIR/android-mcp-emulator-<avd>.log`.
+
+## Token usage
+
+Each tool call is one model turn, and every turn re-reads the whole conversation. Long UI sessions inside a big coding
+conversation get expensive because of that, not because of the tool output. Run UI testing in a fresh session or in
+a subagent with a small context: a ready-made Claude Code subagent definition (`android-tester`, Sonnet, android tools
+only) can live in `~/.claude/agents/android-tester.md`.
 
 ## Typical loop
 
@@ -109,4 +126,5 @@ When several devices are connected, every tool needs `serial` (from `list_device
 - No multi-touch gestures (pinch). Zoom maps with double-tap or their zoom controls.
 - Compose test tags appear as `id=` only if the app sets `Modifier.semantics { testTagsAsResourceId = true }` at its
   root (worth enabling in debug builds); otherwise target Compose elements by text or content description.
-- Screenshots take ~1 s (`screencap`). Prefer `observe: "ui"` and only ask for screenshots where the tree is not enough.
+- Screenshots take ~1 s (`screencap`) and cost far more tokens than the tree; ask for them only where the tree is not
+  enough.
