@@ -1,5 +1,6 @@
 import { XMLParser } from "fast-xml-parser";
 import { ToolError, adb, sleep } from "./adb.js";
+import { agentSource, releaseForDump } from "./agent.js";
 import { type Display, describeDisplay, observedDisplaySize, toScreen } from "./screen.js";
 
 const DUMP_PATH = "/sdcard/window_dump.xml";
@@ -50,13 +51,32 @@ export function lastTree(serial: string): UiTree | undefined {
   return lastTrees.get(serial);
 }
 
-const parser = new XMLParser({
-  ignoreAttributes: false,
-  attributeNamePrefix: "",
-  isArray: (name) => name === "node",
-});
+// preserveOrder keeps siblings in document order; the agent names elements by class (<android.widget.Button>),
+// `uiautomator dump` uses <node class="…">, so tag names can't be used to group children.
+const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "", preserveOrder: true });
 
-type RawNode = Record<string, string> & { node?: RawNode[] };
+interface RawNode {
+  attrs: Record<string, string>;
+  children: RawNode[];
+}
+
+type OrderedEntry = Record<string, unknown> & { ":@"?: Record<string, string> };
+
+function toRawNodes(entries: OrderedEntry[]): RawNode[] {
+  const nodes: RawNode[] = [];
+  for (const entry of entries) {
+    const tag = Object.keys(entry).find((k) => k !== ":@");
+    if (!tag || tag === "#text" || tag.startsWith("?")) continue;
+    nodes.push({ attrs: entry[":@"] ?? {}, children: toRawNodes((entry[tag] as OrderedEntry[]) ?? []) });
+  }
+  return nodes;
+}
+
+/** The nodes below the <hierarchy> root. */
+function parseHierarchy(xml: string): RawNode[] {
+  const top = toRawNodes(parser.parse(xml) as OrderedEntry[]);
+  return top.flatMap((n) => n.children);
+}
 
 function parseBounds(value: string | undefined) {
   const m = value?.match(/\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]/);
@@ -81,21 +101,27 @@ async function dumpXml(serial: string): Promise<string | undefined> {
   }
 }
 
+async function readXml(serial: string): Promise<string | undefined> {
+  const fromAgent = await agentSource(serial);
+  if (fromAgent) return fromAgent;
+  await releaseForDump(serial);
+  const xml = await dumpXml(serial);
+  if (xml) return xml;
+  await sleep(500);
+  return dumpXml(serial);
+}
+
 export async function dumpTree(serial: string): Promise<UiTree> {
-  let xml = await dumpXml(serial);
-  if (!xml) {
-    await sleep(500);
-    xml = await dumpXml(serial);
-  }
+  const xml = await readXml(serial);
   if (!xml) throw new ToolError(TREE_UNAVAILABLE);
 
-  const doc = parser.parse(xml) as { hierarchy?: { node?: RawNode[] } };
+  const roots = parseHierarchy(xml);
   const elements: Element[] = [];
   const packages = new Set<string>();
   let rootWidth = 0;
   let rootHeight = 0;
 
-  const visit = (node: RawNode, depth: number, parent: number): string[] => {
+  const visit = ({ attrs: node, children }: RawNode, depth: number, parent: number): string[] => {
     const b = parseBounds(node.bounds);
     if (depth === 0) {
       rootWidth = Math.max(rootWidth, b.x2);
@@ -112,7 +138,7 @@ export async function dumpTree(serial: string): Promise<UiTree> {
       desc: node["content-desc"] ?? "",
       id: shortId(node["resource-id"] ?? ""),
       childText: "",
-      hasChildren: (node.node?.length ?? 0) > 0,
+      hasChildren: children.length > 0,
       bounds: b,
       clickable: node.clickable === "true",
       longClickable: node["long-clickable"] === "true",
@@ -126,12 +152,12 @@ export async function dumpTree(serial: string): Promise<UiTree> {
       password: node.password === "true",
     };
     elements.push(element);
-    const texts = (node.node ?? []).flatMap((child) => visit(child, depth + 1, element.index));
+    const texts = children.flatMap((child) => visit(child, depth + 1, element.index));
     element.childText = texts.join(" ").slice(0, CHILD_LABEL_MAX);
     const own = element.text || element.desc;
     return own ? [own] : texts;
   };
-  for (const root of doc.hierarchy?.node ?? []) visit(root, 0, -1);
+  for (const root of roots) visit(root, 0, -1);
 
   const display = observedDisplaySize(serial, rootWidth || 1, rootHeight || 1);
   const tree: UiTree = { serial, elements, packages: [...packages], display, takenAt: Date.now() };

@@ -13,7 +13,7 @@ import { withDevice } from "./queue.js";
 import { describeDisplay, display, screenshot, toDevice } from "./screen.js";
 import { type Element, TREE_UNAVAILABLE, dumpTree, findElements, formatTree, lastTree } from "./uitree.js";
 
-const DEFAULT_SETTLE_MS = 500;
+const DEFAULT_SETTLE_MS = 300;
 const WAIT_POLL_MS = 400;
 const FOCUS_WAIT_MS = 3_000;
 

@@ -24,6 +24,24 @@ Enforcement:
 - When an action leaves the app (e.g. `press_key home`), the response says so instead of showing the screen.
 - There is no install tool: install via Android Studio.
 
+## On-device agent (fast UI reads)
+
+The UI tree is read through **Appium's UiAutomator2 server** ([appium-uiautomator2-server](https://www.npmjs.com/package/appium-uiautomator2-server),
+Apache-2.0), which stays running on the device and keeps its accessibility connection open:
+
+- A UI read takes ~0.4 s instead of 2.5–3 s with `uiautomator dump`, and it does not wait for the screen to become idle.
+- Starting it costs ~2 s once per session. It is installed automatically the first time (two APKs:
+  `io.appium.uiautomator2.server` and `io.appium.uiautomator2.server.test`). They are not dev builds, so the dev-app
+  restriction never lets the tools drive them.
+- Compose test tags are exposed as `id=` (`mapTestTagToResourceId`).
+- If the agent can't be started, the tree falls back to `uiautomator dump`. Set `ANDROID_MCP_AGENT=0` in the server's
+  environment to always use the dump.
+- Only one process can hold the accessibility connection, so the server is stopped before falling back to a dump, and
+  other UiAutomator tools (Appium, Maestro) can't run against the device at the same time.
+- Remove it from a device with `adb uninstall io.appium.uiautomator2.server.test && adb uninstall io.appium.uiautomator2.server`.
+
+The APKs come from the npm dependency at install time; this repo does not redistribute them.
+
 ## Setup
 
 Requirements: Node 20+, the Android SDK platform-tools (`adb`) and, for AVDs, the emulator. The SDK is found
@@ -57,15 +75,15 @@ When several devices are connected, every tool needs `serial` (from `list_device
 
 - **One coordinate space.** Screenshots are downscaled so the long edge is at most 1280 px. `get_ui` reports
   element centres in the same space, and every x/y input uses it, so a point read off a screenshot can be tapped as is.
-- **Act + observe in one call.** Action tools wait `settle_ms` (500 ms default) and return the new UI tree
+- **Act + observe in one call.** Action tools wait `settle_ms` (300 ms default) and return the new UI tree
   (`observe: "ui"`), a screenshot, both, or nothing.
 - **Targets.** `tap`/`long_press`/`type_text` take `index` (from the last `get_ui`), `text` (text or content
   description, substring unless `exact`), `id` (resource id / Compose test tag), or `x`+`y`.
 - **`get_ui` output** lists only visible elements that carry text, a description, a leaf id or an interaction
   flag. A clickable container without its own text shows its children's text as `~"…"`, and those children are
   folded into it. `all: true` shows every node.
-- **No tree?** `uiautomator dump` needs the screen to go idle. If it never does (video, endless animation), the
-  tools say so and `get_ui` returns a screenshot instead: continue with x/y taps.
+- **No tree?** If neither the agent nor `uiautomator dump` delivers a tree, the tools say so and `get_ui` returns a
+  screenshot instead: continue with x/y taps.
 - **`logcat`** filters by the app's uid, so lines of a crashed earlier process are still included.
   By default each call only returns lines that are new since the previous call with the same filters.
 - **`start_emulator`** waits up to ~40 s per call (below the MCP request timeout); call it again to keep waiting.
@@ -85,4 +103,4 @@ When several devices are connected, every tool needs `serial` (from `list_device
 - No multi-touch gestures (pinch). Zoom maps with double-tap or their zoom controls.
 - Compose test tags appear as `id=` only if the app sets `Modifier.semantics { testTagsAsResourceId = true }` at its
   root (worth enabling in debug builds); otherwise target Compose elements by text or content description.
-- Each UI dump takes about 1 to 3 s depending on the device. Use `observe: "none"` for steps you don't need to see.
+- Screenshots take ~1 s (`screencap`). Prefer `observe: "ui"` and only ask for screenshots where the tree is not enough.
