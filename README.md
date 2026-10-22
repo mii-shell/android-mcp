@@ -97,6 +97,16 @@ When several devices are connected, every tool needs `serial` (from `list_device
   screenshot instead: continue with x/y taps.
 - **`logcat`** filters by the app's uid, so lines of a crashed earlier process are still included.
   By default each call only returns lines that are new since the previous call with the same filters.
+- **Crash notices.** Every screen tool and `launch_app`/`open_url` check the app for new crashes, ANRs and native
+  crashes after acting (~75 ms) and put a `⚠ … crashed: <exception> at <frame>` notice with the `get_crash` id in front
+  of the result, or of the error if the action failed. Crashes that happen between two calls are reported with the next
+  call; each crash is reported once.
+- **Animations off.** On first use of a device the server sets the window, transition and animator duration scales to
+  0, so steps are faster and the UI is settled when it is read. The original values are restored when the server
+  exits (also on SIGINT/SIGTERM and when the client closes stdin) and kept in `$TMPDIR/android-mcp-animations-<serial>.json`
+  meanwhile, so a server that was killed hard doesn't make the next one treat 0 as original. If a server was
+  killed hard (`kill -9`), the next server restores the device when it exits. Set `ANDROID_MCP_KEEP_ANIMATIONS=1` to
+  leave the settings alone.
 - **`list_crashes` / `get_crash`** read the system DropBox (`dumpsys dropbox`): Java crashes, ANRs and native
   crashes of the app, newest first, each with exception and top frame; `get_crash` returns the full report with the
   complete stack trace. Unlike logcat, these reports survive the process and log rotation. `since_minutes` limits the

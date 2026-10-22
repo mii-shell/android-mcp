@@ -105,3 +105,80 @@ export async function deviceTimeMinutesAgo(serial: string, minutes: number): Pro
   const epoch = Number((await shell(serial, "date +%s")).trim()) - minutes * 60;
   return (await shell(serial, `date -d @${epoch} '+%Y-%m-%d %H:%M:%S'`)).trim();
 }
+
+interface DeviceClock {
+  /** Device epoch minus host epoch, in ms. */
+  skewMs: number;
+  /** Device time zone offset, in minutes east of UTC. */
+  tzMinutes: number;
+}
+
+const clocks = new Map<string, DeviceClock>();
+
+async function deviceClock(serial: string): Promise<DeviceClock> {
+  const cached = clocks.get(serial);
+  if (cached) return cached;
+  const before = Date.now();
+  const out = (await shell(serial, "date +%s%z")).trim();
+  const after = Date.now();
+  const m = out.match(/^(\d+)([+-])(\d{2})(\d{2})$/);
+  if (!m) throw new ToolError(`Unexpected device date output: ${out}`);
+  const clock = {
+    skewMs: Number(m[1]) * 1000 - (before + after) / 2,
+    tzMinutes: (m[2] === "-" ? -1 : 1) * (Number(m[3]) * 60 + Number(m[4])),
+  };
+  clocks.set(serial, clock);
+  return clock;
+}
+
+/** The device's local wall-clock time `msAgo` before now, in the DropBox timestamp format. */
+async function deviceTime(serial: string, msAgo: number): Promise<string> {
+  const clock = await deviceClock(serial);
+  const local = new Date(Date.now() - msAgo + clock.skewMs + clock.tzMinutes * 60_000);
+  return local.toISOString().slice(0, 19).replace("T", " ");
+}
+
+interface Watch {
+  since: string;
+  reported: Set<string>;
+}
+
+/** Per device + package: from when crashes count as new, and which were already reported. */
+const watches = new Map<string, Watch>();
+
+/** Starts watching a package for crashes, if not already watched. Cheap after the first call. */
+export async function watchCrashes(serial: string, pkg: string): Promise<void> {
+  const key = `${serial}|${pkg}`;
+  if (!watches.has(key)) watches.set(key, { since: await deviceTime(serial, 1_000), reported: new Set() });
+}
+
+/**
+ * New crashes of `pkg` since the watch started, each reported once. Lists DropBox headers first (~75 ms)
+ * and reads full reports only when a matching entry appeared.
+ */
+export async function newCrashNotice(serial: string, pkg: string): Promise<string | undefined> {
+  const watch = watches.get(`${serial}|${pkg}`);
+  if (!watch) return undefined;
+  const headers = await shell(serial, `dumpsys dropbox | grep -E '^[0-9-]+ [0-9:]+ (${Object.values(TAGS).join("|")}) '`).catch(
+    () => "",
+  );
+  const types = new Set<CrashType>();
+  for (const line of headers.split("\n")) {
+    const m = line.match(ENTRY_HEADER);
+    if (!m || m[1] < watch.since) continue;
+    const type = CRASH_TYPES.find((t) => TAGS[t] === m[2]);
+    if (type && !watch.reported.has(`${type}@${m[1]}`)) types.add(type);
+  }
+  if (!types.size) return undefined;
+  const fresh = (await readCrashes(serial, pkg, [...types])).filter((c) => c.time >= watch.since && !watch.reported.has(c.id));
+  if (!fresh.length) return undefined;
+  for (const c of fresh) watch.reported.add(c.id);
+  const what = (c: Crash) => ({ crash: "crashed", anr: "stopped responding (ANR)", native: "crashed (native)" })[c.type];
+  return fresh
+    .map((c) => `⚠ ${pkg} ${what(c)} at ${c.time}: ${c.headline}${c.location ? `\n    at ${c.location}` : ""}\n    get_crash id: ${c.id}`)
+    .join("\n");
+}
+
+export function watchedPackages(serial: string): string[] {
+  return [...watches.keys()].filter((k) => k.startsWith(`${serial}|`)).map((k) => k.slice(serial.length + 1));
+}

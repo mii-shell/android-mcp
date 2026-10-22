@@ -7,7 +7,18 @@ import { ToolError, sleep } from "./adb.js";
 import * as apps from "./apps.js";
 import * as device from "./device.js";
 import * as input from "./input.js";
-import { CRASH_TYPES, deviceTimeMinutesAgo, findCrash, formatCrash, formatCrashList, readCrashes } from "./crashes.js";
+import { disableAnimations, restoreAnimations } from "./animations.js";
+import {
+  CRASH_TYPES,
+  deviceTimeMinutesAgo,
+  findCrash,
+  formatCrash,
+  formatCrashList,
+  newCrashNotice,
+  readCrashes,
+  watchCrashes,
+  watchedPackages,
+} from "./crashes.js";
 import { LOG_LEVELS, logcat } from "./logcat.js";
 import { POLICY_DESCRIPTION, assertDevApp, assertForegroundAllowed, devAppVerdict, foregroundProblem, listDevApps } from "./policy.js";
 import { withDevice } from "./queue.js";
@@ -111,9 +122,34 @@ function onDevice<A extends { serial?: string }>(fn: (serial: string, args: A) =
 /** Like onDevice, but refuses to run unless an allowed dev app is in the foreground. */
 function inDevApp<A extends { serial?: string }>(fn: (serial: string, args: A) => Promise<Content>) {
   return onDevice<A>(async (serial, args) => {
-    await assertForegroundAllowed(serial);
-    return fn(serial, args);
+    let pkg: string | undefined;
+    try {
+      pkg = await assertForegroundAllowed(serial);
+    } catch (e) {
+      // The app may have left the foreground because it crashed since the last call: say so.
+      const notices = await Promise.all(watchedPackages(serial).map((p) => newCrashNotice(serial, p).catch(() => undefined)));
+      const notice = notices.filter(Boolean).join("\n");
+      if (notice && e instanceof ToolError) throw new ToolError(`${notice}\n${e.message}`);
+      throw e;
+    }
+    await disableAnimations(serial);
+    return withCrashWatch(serial, pkg, () => fn(serial, args));
   });
+}
+
+/** Runs an action and puts a notice in front of its result (or error) when the app crashed meanwhile. */
+async function withCrashWatch(serial: string, pkg: string | undefined, run: () => Promise<Content>): Promise<Content> {
+  if (!pkg) return run();
+  await watchCrashes(serial, pkg);
+  try {
+    const out = await run();
+    const notice = await newCrashNotice(serial, pkg);
+    return notice ? [...text(notice), ...out] : out;
+  } catch (e) {
+    const notice = await newCrashNotice(serial, pkg).catch(() => undefined);
+    if (notice && e instanceof ToolError) throw new ToolError(`${notice}\n${e.message}`);
+    throw e;
+  }
 }
 
 async function observe(serial: string, mode: ObserveMode, settleMs: number): Promise<Content> {
@@ -300,10 +336,11 @@ tool(
     if (a.activity?.includes("/") && !a.activity.startsWith(`${a.package}/`)) {
       throw new ToolError(`Activity ${a.activity} does not belong to ${a.package}.`);
     }
-    return [
+    await disableAnimations(serial);
+    return withCrashWatch(serial, a.package, async () => [
       ...text(await apps.launchApp(serial, a.package, a.activity)),
       ...(await observe(serial, a.observe, Math.max(a.settle_ms, 1500))),
-    ];
+    ]);
   }),
 );
 
@@ -333,10 +370,11 @@ tool(
   { ...SERIAL, url: z.string(), package: z.string().describe("The dev app that should handle the link"), ...OBSERVE },
   onDevice(async (serial, a) => {
     await assertDevApp(serial, a.package);
-    return [
+    await disableAnimations(serial);
+    return withCrashWatch(serial, a.package, async () => [
       ...text(await apps.openUrl(serial, a.url, a.package)),
       ...(await observe(serial, a.observe, Math.max(a.settle_ms, 1000))),
-    ];
+    ]);
   }),
 );
 
@@ -696,6 +734,11 @@ tool(
     return [...text(`Pressed ${code}.`), ...(await observe(serial, a.observe, a.settle_ms))];
   }),
 );
+
+// Restore the animation settings however the server ends: normal exit, signal, or the client closing stdin.
+process.on("exit", restoreAnimations);
+for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.on(signal, () => process.exit(0));
+process.stdin.on("end", () => process.exit(0));
 
 await server.connect(new StdioServerTransport());
 console.error("android-mcp ready");

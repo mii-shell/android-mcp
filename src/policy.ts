@@ -66,8 +66,11 @@ export async function listDevApps(serial: string): Promise<string[]> {
 }
 
 /** Returns why the foreground may not be used, or undefined when it may. */
-export async function foregroundProblem(serial: string): Promise<string | undefined> {
-  const app = await currentApp(serial);
+export async function foregroundProblem(
+  serial: string,
+  app?: { pkg: string; activity: string },
+): Promise<string | undefined> {
+  app ??= await currentApp(serial);
   if (!app) return "Could not determine the app in the foreground.";
   if (SYSTEM_DIALOG_PACKAGES.has(app.pkg)) return undefined;
   const verdict = await devAppVerdict(serial, app.pkg);
@@ -78,7 +81,10 @@ export async function foregroundProblem(serial: string): Promise<string | undefi
   );
 }
 
-export async function assertForegroundAllowed(serial: string): Promise<void> {
-  const problem = await foregroundProblem(serial);
+/** Returns the allowed dev app in the foreground (undefined while a system permission dialog is shown). */
+export async function assertForegroundAllowed(serial: string): Promise<string | undefined> {
+  const app = await currentApp(serial);
+  const problem = await foregroundProblem(serial, app);
   if (problem) throw new ToolError(problem);
+  return app && !SYSTEM_DIALOG_PACKAGES.has(app.pkg) ? app.pkg : undefined;
 }
